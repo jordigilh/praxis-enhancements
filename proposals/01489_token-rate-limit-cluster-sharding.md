@@ -38,14 +38,23 @@ limit proposal [00121][token-rate-proposal].
 The current experimental filter matches ordered rules, reserves an estimate
 before forwarding a request, and reconciles the same reservation against
 provider usage after the response. State can be process-local or shared through
-Valkey/Redis, and the shared path uses one atomic Lua operation for each
-budget/bucket.
+Valkey/Redis.
 
-The current v1 key layout derives physical keys from the namespace, rule, and
-bucket, then maintains namespace-level indexes. Those keys do not share one
-canonical Cluster hash tag, and the current client connection is not a native
-Cluster topology owner. This proposal changes placement and topology ownership,
-not the reservation lifecycle.
+On `ai/main`, the shared Valkey path uses the v2 key layout and plain Valkey
+commands rather than server-side Lua scripts. Sliding-window usage is kept in
+fixed sub-window counters: admission reads the relevant counters and then
+increments the current sub-window. Concurrent sliding-window admissions are not
+serialized, so requests racing on one key can temporarily overshoot the budget
+by their combined estimates for one round trip; usage written by those requests
+is not lost. Token-bucket admission uses an optimistic `WATCH`/`MULTI`/`EXEC`
+transaction per key.
+
+The v2 layout derives physical keys from the namespace, algorithm, rule, and
+budget key, and maintains a namespace-and-algorithm active-reservation index
+plus a per-rule retained-key index. Those keys do not share one canonical
+Cluster hash tag, and the current client connection is not a native Cluster
+topology owner. This proposal changes placement and topology ownership, not
+the reservation lifecycle.
 
 ### Complete accounting group
 
@@ -68,6 +77,20 @@ quota:{org-42}:team-y:active
 `team-x` and `team-y` are suffixes, not independent Cluster tags. The global cap
 is a separate logical component of the same group and must not be copied into
 each team ledger.
+
+### Existing cap scopes
+
+The current shared-backend contract scopes `max_active_reservations` to the
+namespace and algorithm, while `max_keys` is scoped per rule. Cluster mode must
+preserve those scopes unless maintainers explicitly approve a contract change.
+
+The namespace-and-algorithm active-reservation index is therefore an exact
+dependency across rules using that namespace and algorithm. Any groups that
+share it must be joined into one complete accounting group and one Cluster slot,
+or Cluster configuration must be rejected. Per-rule retained-key indexes can
+remain within each rule's group. Making the active-reservation cap per group
+would change the existing semantics and requires explicit approval plus
+generation/migration treatment.
 
 ### Reservation and sharding boundary
 
@@ -126,8 +149,10 @@ otherwise it is rejected.
 - Divided, copied, or approximate global caps.
 - A second reserve/reconcile implementation for Cluster.
 - Mixed-generation serving, implicit reset, dual-writing, or ambiguous replay.
-- Performance benchmarking or Limitador/Kuadrant compatibility, which remain in
-  [ai#1482][ai-1482] and [ai#844][ai-844].
+- Sentinel performance benchmarking, which remains in [ai#1482][ai-1482].
+- Native Redis/Valkey Cluster performance qualification, which requires a
+  separate follow-up and is not claimed by this proposal.
+- Limitador/Kuadrant compatibility, which remains in [ai#844][ai-844].
 
 ### Open questions for the follow-up design
 
@@ -144,16 +169,22 @@ otherwise it is rejected.
 
 ### Motivation
 
-The current ledger performs multi-key atomic reserve, reconcile, and cleanup
-operations. Redis/Valkey Cluster can execute a Lua operation atomically only when
-all supplied keys map to one hash slot. Splitting the current layout causes
-cross-slot failures; putting the entire namespace under one tag removes useful
-sharding; and dividing a global cap changes its meaning.
+The current shared backend uses the v2 key layout and plain Valkey commands,
+with `WATCH`/`MULTI`/`EXEC` where token-bucket read-modify-write and reservation
+settlement require it. Sliding-window admission is not globally serialized:
+requests that race can temporarily overshoot, while the usage they write is not
+lost. Redis/Valkey Cluster still requires all keys participating in an operation
+that must be atomic to map to one hash slot. Applying the current layout
+without a Cluster-aware contract can therefore cause cross-slot failures or
+non-atomic client-side decomposition; putting the entire namespace under one
+tag removes useful sharding; and dividing a global cap changes its meaning.
 
-The complete-accounting-group boundary is therefore the smallest unit that can
-preserve exactness while allowing independent groups to scale across primaries.
-An organization-wide cap intentionally makes all governed teams one atomic
-group.
+The complete-accounting-group boundary is therefore the smallest future
+contract unit that can preserve exact multi-key updates while allowing
+independent groups to scale across primaries. An organization-wide cap
+intentionally makes all governed teams one atomic group. This is a requirement
+for the proposed Cluster contract, not a claim that today's sliding-window
+admission is globally serialized.
 
 ### Rejected alternatives
 
@@ -169,10 +200,13 @@ group.
 
 ### Qualification context
 
-Existing qualification establishes the reserve/reconcile and single-primary HA
-behavior for Redis and Red Hat Valkey and exposes the Cluster same-slot
-constraint. The sharding implementation must demonstrate real multi-primary
-distribution without weakening typed atomic ledger semantics.
+Existing functional qualification establishes the reserve/reconcile and
+single-primary HA behavior for Redis and Red Hat Valkey and exposes the Cluster
+same-slot constraint. The dedicated-hardware Sentinel performance qualification
+is tracked in [ai#1482][ai-1482]; it does not qualify native Redis/Valkey
+Cluster. Cluster performance requires a separate follow-up. The sharding
+implementation must demonstrate real multi-primary distribution without
+weakening typed atomic ledger semantics.
 
 [ai-1482]: https://github.com/praxis-proxy/ai/issues/1482
 [ai-844]: https://github.com/praxis-proxy/ai/issues/844
